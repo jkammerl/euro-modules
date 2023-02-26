@@ -20,13 +20,11 @@
 //MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI);
 
 // this is  working too both lines
-#ifdef SERIAL_MIDI
 #include <MIDI.h>
-MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDI);
-#else
 #include <USB-MIDI.h>
+
+MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDISER);
 USBMIDI_CREATE_DEFAULT_INSTANCE();
-#endif
 
 /*
 
@@ -99,11 +97,8 @@ SSD1306AsciiWire display;
      ████   ██   ██ ██   ██ ██ ██   ██ ██████  ███████ ███████ ███████
 
  */
-#ifdef SERIAL_MIDI
-#define VERSION "SERIAL MODE"
-#else
-#define VERSION "USB MODE"
-#endif
+#define VERSION "Karl Bartos"
+
 #define ON 0
 #define OFF 1
 
@@ -224,8 +219,6 @@ volatile bool rotF = 0;          // to know that the rotary was rotated
                                  // because use in rot
                                  // 1 to force first channel update
 
-byte SetChannel = 1; // to store the MIDI channel : set to 1 to start
-
 /*
 ███████╗██╗   ██╗ ██████╗███╗   ██╗████████╗██╗ ██████╗ ███╗   ██╗███████╗
 ██╔════╝██║   ██║██╔════╝████╗  ██║╚══██╔══╝██║██╔═══██╗████╗  ██║██╔════╝
@@ -236,20 +229,6 @@ byte SetChannel = 1; // to store the MIDI channel : set to 1 to start
                                                                           
 */
 
-void updateChannel()
-{
-  if (rotF)
-  {
-    Wire.setClock(1500000L); // speed the display to the max
-    display.setCursor(0, 6);
-    display.clearToEOL();
-    display.print("Channel ");
-    display.println(interruptCount);
-    Wire.setClock(500000L);
-  }
-  rotF = 0;
-  SetChannel = interruptCount;
-}
 void rot()
 {
 
@@ -326,7 +305,7 @@ void Strobe()
   digitalWrite(RW, HIGH);
 }
 
-void Command(byte registre, byte value)
+void Command(byte registre, uint8_t value)
 {
 
   digitalWrite(RS0, registre & B00000001);
@@ -453,7 +432,7 @@ void TriggerPhonem(const size_t phonem_idx)
 
   size_t idx = phonem_idx;
   const float randf = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
-  if (phonem_idx != kPA0PhonemIdx &&
+  if (cv_control_enabled && phonem_idx != kPA0PhonemIdx &&
       randf < sc02_config.randomization)
   {
     idx = rand() % (kNumPhonems - 1);
@@ -482,7 +461,7 @@ void handleNoteOn(byte channel, byte pitch, byte velocity)
   //Serial.println();
   analogWrite(RED_LED, 255 - (velocity << 1));
 
-  if (channel == SetChannel)
+  if (channel == 1)
   {
 
     last_note_on = pitch;
@@ -494,6 +473,15 @@ void handleNoteOn(byte channel, byte pitch, byte velocity)
     TriggerPhonem(pitch - 36);
     // }
   }
+  if (channel == 2) // Controls Pitch
+  {
+    // Pitch control via MIDI
+    Serial.printf("Note on: channel = %d, pitch = %d, velocity - %d", channel, pitch, velocity);
+    int sc02_pitch  = (pitch * 0xFF  / 12) >> 3;
+    Command(1, sc02_pitch );
+    
+    //ltc6903(10, pitch*8);
+  }  
 }
 
 void handleNoteOff(byte channel, byte pitch, byte velocity)
@@ -502,7 +490,7 @@ void handleNoteOff(byte channel, byte pitch, byte velocity)
   //Serial.printf("Note off: channel = %d, pitch = %d, velocity - %d", channel, pitch, velocity);
   //Serial.println();
 
-  if (channel == SetChannel)
+  if (channel == 1)
   {
     if (last_note_on == pitch)
     {
@@ -547,23 +535,31 @@ void setup()
   // Initialize MIDI, and listen to all MIDI channels
   // This will also call usb_midi's begin()
   MIDI.begin(MIDI_CHANNEL_OMNI);
+  MIDISER.begin(MIDI_CHANNEL_OMNI);
 
   // Attach the handleNoteOn function to the MIDI Library. It will
   // be called whenever the Bluefruit receives MIDI Note On messages.
   MIDI.setHandleNoteOn(handleNoteOn);
+  MIDISER.setHandleNoteOn(handleNoteOn);
 
   // Do the same for MIDI Note Off messages.
   MIDI.setHandleNoteOff(handleNoteOff);
+  MIDISER.setHandleNoteOff(handleNoteOff);
 
   MIDI.setHandleControlChange(controlChange);
+  MIDISER.setHandleControlChange(controlChange);
 
   MIDI.setHandlePitchBend(pitchBend);
+  MIDISER.setHandlePitchBend(pitchBend);
 
   MIDI.setHandleClock(Clock);
+  MIDISER.setHandleClock(Clock);
 
   MIDI.setHandleStart(Start);
+  MIDISER.setHandleStart(Start);
 
   MIDI.setHandleStop(Stop);
+  MIDISER.setHandleStop(Stop);
 
   Serial.begin(115200);
 
@@ -588,7 +584,7 @@ void setup()
   display.setFont(fixed_bold10x15);
   display.println("Robovox MIDI");
   display.setRow(4);
-  display.println("Ver. 0.07");
+  display.println("Ver. 0.08");
   display.setRow(6);
   display.println(VERSION);
 
@@ -621,7 +617,8 @@ void setup()
   SC02.writeIODIR(0x0);
 
   Command(3, 128); //Control bit to 1 (128)
-  Command(0, 192); // load DR1 DR2 bit to 1 (to activate A/R request mode) (192)
+  Command(0, 0xb11000000); // load DR1 DR2 bit to 1 (to activate A/R request mode) (192)
+  //Command(0, 0xb1000000); // load DR1 DR2 bit to 1 (to activate A/R request mode) (192)
   Command(3, 0);   // //Control bit to 0
 
   resetSC02Config();
@@ -707,7 +704,7 @@ void loop()
 {
   // read any new MIDI messages
   MIDI.read();
+  MIDISER.read();
   //digitalWrite(MISO, digitalRead(SW1));
   updateSC02();
-  updateChannel();
 }
