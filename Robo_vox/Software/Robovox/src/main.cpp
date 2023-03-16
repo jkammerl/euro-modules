@@ -6,6 +6,9 @@
 
 #include <limits>
 
+#include <math.h> //<cmath> in case of c++
+
+
 #include "MCP23008.h" //from http://gtbtech.com/?p=875
 #include "Wire.h"
 #include "SDU.h"
@@ -229,6 +232,13 @@ volatile bool rotF = 0;          // to know that the rotary was rotated
                                                                           
 */
 
+float noteToFreq(int note) {
+    float a = 440; //frequency of A (coomon value is 440Hz)
+    return (a / 32) * pow(2, ((note - 9) / 12.0));
+}
+
+
+
 void rot()
 {
 
@@ -329,6 +339,7 @@ void resetSC02Config()
   sc02_config.inflection = B01111111;
   sc02_config.rate = B1100;
   ltc6903(10, 516); //Set pitch to middle of pitch wheel
+  Wire.setClock(500000L); //Restore I2C speed to allow speech
 }
 
 void toggleCVControl()
@@ -367,10 +378,9 @@ void WritePhonemToSc02(byte value)
 void controlChange(byte channel, byte number, byte value)
 {
   switch (number)
-
   {
   case 1: // modulation
-    Command(4, map(value, 0, 127, 200, 251));
+    //Command(4, map(value, 0, 127, 200, 251));
     break;
 
   case 2:
@@ -380,11 +390,11 @@ void controlChange(byte channel, byte number, byte value)
     Command(1, (Word & 0b011111111000) >> 3);
     but the next command seems to work ?
   */
-    Command(1, (value << 1));
+    //Command(1, (value << 1));
     break;
   case 3:
     value = value >> 3;
-    Command(2, (value << 4) + B1000);
+    //Command(2, (value << 4) + B1000);
     break;
 
   case 64:
@@ -412,11 +422,13 @@ void Start()
 {
   DivClock = 0;
   Sprintln("Start");
+  trigger_sc02_reset = true;
 }
 
 void Stop()
 {
   Sprint("Stop");
+  trigger_sc02_reset = true;
 }
 
 void pitchBend(byte channel, int bend)
@@ -476,9 +488,14 @@ void handleNoteOn(byte channel, byte pitch, byte velocity)
   if (channel == 2) // Controls Pitch
   {
     // Pitch control via MIDI
-    Serial.printf("Note on: channel = %d, pitch = %d, velocity - %d", channel, pitch, velocity);
-    int sc02_pitch  = (pitch * 0xFF  / 12) >> 3;
-    Command(1, sc02_pitch );
+    Serial.printf("Note on: channel = %d, pitch = %d, velocity - %d\n", channel, pitch, velocity);
+    const float freq = noteToFreq(pitch);  
+
+    // SC02 clock rate = (2^10)*(2078/(2-516/1024)) = 1422285.20104
+    ltc6903(10, 516); //Set pitch to middle of pitch wheel
+    constexpr float kSc02ClockRate = 1422285.20104f;
+    const int inf =  0xFFF - (kSc02ClockRate / freq / 8);   
+    Command(1, inf >>3);
     
     //ltc6903(10, pitch*8);
   }  
