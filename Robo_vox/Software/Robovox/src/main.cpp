@@ -15,6 +15,7 @@
 #include "SSD1306Ascii.h"
 #include "SSD1306AsciiWire.h"
 #include "SDU.h" // to allow updates from SD card
+#include "sc02_pitch.h"
 
 #define MCP23008_ADDR 0x20
 
@@ -232,13 +233,6 @@ volatile bool rotF = 0;          // to know that the rotary was rotated
                                                                           
 */
 
-float noteToFreq(int note) {
-    float a = 440; //frequency of A (coomon value is 440Hz)
-    return (a / 32) * pow(2, ((note - 9) / 12.0));
-}
-
-
-
 void rot()
 {
 
@@ -315,12 +309,12 @@ void Strobe()
   digitalWrite(RW, HIGH);
 }
 
-void Command(byte registre, uint8_t value)
+void Command(byte reg, uint8_t value)
 {
 
-  digitalWrite(RS0, registre & B00000001);
-  digitalWrite(RS1, registre & B00000010);
-  digitalWrite(RS2, registre & B00000100);
+  digitalWrite(RS0, reg & B00000001);
+  digitalWrite(RS1, reg & B00000010);
+  digitalWrite(RS2, reg & B00000100);
 
   SC02.writeGPIO(value);
   delayMicroseconds(1);
@@ -330,15 +324,56 @@ void Command(byte registre, uint8_t value)
 
 void resetSC02Config()
 {
-  Command(3, B01111111); // Set articulation to normal and amplitude to maximum  & CTL to 0
-  Command(4, B11110000); // Set Filter frequency to normal (231)
-  Command(2, B11001000); // Set Speech rate to normal (168)
-  Command(1, B01111111); // inflection
+  // Command(3, B01111111); // Set articulation to normal and amplitude to maximum  & CTL to 0
+  // Command(4, B11110000); // Set Filter frequency to normal (231)
+  // Command(2, B11001000); // Set Speech rate to normal (168)
+  // Command(1, B01111111); // inflection
+
+  Command(3, 0x80); // Set Control Bit 7 High
+  Command(0, 0x80); // Write to Phoneme Reg (Value 0x80 = Sustain/Loop?)
+  Command(3, 0x00); // Clear Control Bit 7 Low (Latch?)  
+
+  // CONFIGURE INFLECTION MODE (Register 2)
+  // The code commonly ORs the rate base with 0xA0 (1010 0000).
+  // Bit 7 (1): External Inflection Mode. 
+  //            0 = Chip calculates pitch based on phoneme (Talking).
+  //            1 = Chip uses Register 1 value (Singing/MIDI).
+  // Bit 5 (1): Pitch Control / Step Mode.
+  // Bit 0-3 (9): Rate (Speech Speed). 9 is a medium setting.
+  uint8_t default_rate_base  = 0x09;  
+  uint8_t r2_value = default_rate_base | 0xA0; 
+  Command(2, r2_value);
+
+  // Sets the baseline frequency. 0x11 is a relatively high pitch 
+  // (Lower value = Higher Frequency).
+  uint8_t default_pitch_fine = 0x11;
+  Command(1, default_pitch_fine);  
+
+  // CONFIGURE CONTROL & AMPLITUDE (Register 3)
+  // Value: 0x5C (Binary 0101 1100)
+  // [0-3] Amplitude: 0xC (12/15). Sets a high default volume.
+  // [4-5] Unused/Test: 01.
+  // [6]   Amplitude Mode: 1. Likely "Instant Update".
+  //       Normal speech updates amplitude only at phoneme boundaries.
+  //       Setting this allows MIDI Velocity to change volume instantly.
+  // [7]   Control: 0.
+  Command(3, 0x5C);
+
+  // CONFIGURE VOCAL TRACT FILTER (Register 4)
+  // Value: 0xE9 (Binary 1110 1001)
+  // This sets the clock frequency for the switched-capacitor filters.
+  // It determines the "timbre" or formants of the voice.
+  // 0xE9 is the preset chosen by the developer for a neutral singing voice.
+  Command(4, 0xE9);
+
+  // 7. IDLE STATE (Register 0)
+  // Phoneme 0x00 is PA0 (Pause 0 ms / Silence).
+  Command(0, 0x00);  
 
   sc02_config.filter_freq = B11110000;
   sc02_config.inflection = B01111111;
   sc02_config.rate = B1100;
-  ltc6903(10, 516); //Set pitch to middle of pitch wheel
+  ltc6903(10, 959); 
   Wire.setClock(500000L); //Restore I2C speed to allow speech
 }
 
@@ -472,32 +507,46 @@ void handleNoteOn(byte channel, byte pitch, byte velocity)
   //Serial.printf("Note on: channel = %d, pitch = %d, velocity - %d", channel, pitch, velocity);
   //Serial.println();
   analogWrite(RED_LED, 255 - (velocity << 1));
-
   if (channel == 1)
   {
-
-    last_note_on = pitch;
     pitch = constrain(pitch, 36, 93);
+    last_note_on = pitch;
+    // VELOCITY / AMPLITUDE SETUP (Register 3) ---
+    // SC-02 Amplitude is 4 bits (0-15). MIDI is 0-127.
+    // The assembly performs 3 Right Shifts (LSR A) to scale 127 -> 15.
+    uint8_t amplitude = velocity >> 3; 
+
+    // CRITICAL: We must preserve the Control Bits in Register 3.
+    // specifically Bit 6 (0x40), which enables "Immediate A/R Update".
+    // Without this, the volume change would lag.
+    // Mask 0x70 is used in assembly to keep bits 4,5,6.
+    // We assume 0x40 is the active flag we care about based on Init.
+    uint8_t reg3_val = 0x40 | (amplitude & 0x0F);
 
     // digitalWrite(BUSY, ON); // to measure latency from MIDI Note On to speech
     // Apply Velocity.
-    Command(3, map(velocity, 0, 127, 0, 15) + B00110000);
-    TriggerPhonem(pitch - 36);
-    // }
+    Command(3, reg3_val);
+    TriggerPhonem(pitch - 36); 
   }
+
   if (channel == 2) // Controls Pitch
   {
+    // Calculate Table Index: Note * 2
+    int index = pitch * 2;
+    // Fetch Low Byte (Inflection Value)
+    uint8_t pitch_low = PITCH_TABLE[index];
+    uint8_t pitch_high = PITCH_TABLE[index + 1];
+    // Bit 7 (Inflection Mode) and Bit 5 (Amplitude?) set.
+    uint8_t reg2_val = pitch_high | 0xA0;
+
+    // 5. Write to SC-02
+    Command(1, pitch_low);
+    Command(2, reg2_val);
+
     // Pitch control via MIDI
     Serial.printf("Note on: channel = %d, pitch = %d, velocity - %d\n", channel, pitch, velocity);
-    const float freq = noteToFreq(pitch);  
-
-    // SC02 clock rate = (2^10)*(2078/(2-516/1024)) = 1422285.20104
-    ltc6903(10, 516); //Set pitch to middle of pitch wheel
-    constexpr float kSc02ClockRate = 1422285.20104f;
-    const int inf =  0xFFF - (kSc02ClockRate / freq / 8);   
-    Command(1, inf >>3);
-    
-    //ltc6903(10, pitch*8);
+    // ltc6903(10, 1024); //Set pitch to middle of pitch wheel
+    ltc6903(10, 959);
   }  
 }
 
@@ -601,11 +650,12 @@ void setup()
   display.setFont(fixed_bold10x15);
   display.println("Robovox MIDI");
   display.setRow(4);
-  display.println("Ver. 0.08");
+  display.println("Ver. 0.10");
   display.setRow(6);
   display.println(VERSION);
+  delay(50);
 
-  ltc6903(10, 516); //Set pitch to middle of pitch wheel
+  ltc6903(10, 959);
 
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
@@ -632,11 +682,6 @@ void setup()
 
   //Reset();
   SC02.writeIODIR(0x0);
-
-  Command(3, 128); //Control bit to 1 (128)
-  Command(0, 0xb11000000); // load DR1 DR2 bit to 1 (to activate A/R request mode) (192)
-  //Command(0, 0xb1000000); // load DR1 DR2 bit to 1 (to activate A/R request mode) (192)
-  Command(3, 0);   // //Control bit to 0
 
   resetSC02Config();
 
@@ -712,7 +757,11 @@ void updateSC02()
   byte rate = map(analogRead(A4), 0, 0x03FF, 0, 0x0F);
   if (rate != sc02_config.rate)
   {
-    Command(2, (rate << 4) + B1000);
+    // 0xA0 (1010 0000) Sets the required Control Bits:
+    //   - Bit 7 (1): External Pitch Mode. Required to make the 'inflection' pot work.
+    //   - Bit 5 (1): Step/Amp Control. (Based on 6502 singing firmware).
+    //   - Bits 0-3: The 'rate' variable goes here (no shift needed).
+    Command(2, 0xA0 | (rate & 0x0F)); 
     sc02_config.rate = rate;
   }
 }
